@@ -10,6 +10,22 @@ require 'yaml'
 
 require_relative 'ruby-progressbar-twoline/ruby-progressbar-twoline.rb'
 
+class ProgressBarLogDelegator < SimpleDelegator
+  def puts(*m)
+    log(*m)
+  end
+end
+
+def make_progess_bar(total:)
+  progressbar = ProgressBar.create(
+    format: "%t %b%i\n%a %E  Processed: %c of %C, %P%",
+    remainder_mark: '-',
+    total: total,
+  )
+  logger = ProgressBarLogDelegator.new(progressbar)
+  [progressbar, logger]
+end
+
 STDOUT.sync = true
 
 def debug(*args)
@@ -154,17 +170,19 @@ def cached(name:, refresh:)
 end
 
 class GetEventDetails
-  def initialize(event_id:)
+  def initialize(event_id:, logger:)
     @event_id = event_id
+    @logger = logger
   end
 
   def call
     get_event_details
+      .tap { |x| logger.puts x.ai }
   end
 
   private
 
-  attr_reader :event_id
+  attr_reader :event_id, :logger
 
   def get_event_details
     response = http
@@ -184,7 +202,8 @@ class GetEventDetails
     json = html
       .scan(%r{<script[> ].+?</script>})
       .find { |s| s.include?('"address":{"') }
-      .gsub(%r{</?script[^>]*>}, '')
+      &.gsub(%r{</?script[^>]*>}, '')
+    return unless json
     JSON.parse(json, symbolize_names: true)
       .to_snake_keys
   end
@@ -194,22 +213,19 @@ class GetEventDetails
   end
 end
 
-puts 'Bands:'
-bands = cached(name: 'bands', refresh: ARGV.include?('--refresh-bands')) do
+puts 'Collecting band IDs from profile likes API...'
+bands = cached(name: 'bands', refresh: ARGV.include?('--refresh-band-list')) do
   GetBands.new(my_id: 1597675905).call
 end
 
-progressbar = ProgressBar.create(
-  format: "%t %b%i\n%a %E  Processed: %c of %C, %P%",
-  remainder_mark: '-',
-  total: bands.count,
-)
-logger = Class.new(SimpleDelegator) { def puts(*m); log(*m); end }.new(progressbar)
+puts 'Collecting event IDs by scraping band pages...'
+
+progressbar, logger = make_progess_bar(total: bands.count)
 
 output = bands.map do |band|
   band_id = band.fetch(:id)
 
-  event_ids = cached(name: "event-ids-for-band-#{band_id}", refresh: ARGV.include?('--refresh-events')) do
+  event_ids = cached(name: "event-ids-for-band-#{band_id}", refresh: ARGV.include?('--refresh-event-list')) do
     GetPageEventIds.new(page_id: band_id, logger: logger).call
   end
 
@@ -228,7 +244,26 @@ end
 progressbar.stop
 ap output
 
-event_details = GetEventDetails.new(event_id: 752174271880245).call
-ap event_details
-require 'pry'; binding.pry
-puts
+puts 'Collecting event details by scraping event pages...'
+
+events_count = output.sum { |band| band.fetch(:events).count }
+progressbar, logger = make_progess_bar(total: events_count)
+
+output_with_event_details = output.map do |band|
+  band.merge(
+    events: band[:events].map do |event|
+      event_id = event.fetch(:id)
+      event_details = cached(name: "event-details-for-event-#{event_id}", refresh: ARGV.include?('--refresh-event-details')) do
+        GetEventDetails.new(event_id: event_id, logger: logger).call
+      end
+
+      progressbar.increment
+
+      event.merge(
+        details: event_details
+      )
+    end
+  )
+end
+progressbar.stop
+ap output_with_event_details

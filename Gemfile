@@ -5,6 +5,7 @@ gem 'facets'
 gem 'http'
 gem 'plissken'
 gem 'ruby-progressbar', '= 1.7.5'
+gem 'nokogiri'
 
 group :development do
   gem 'pry-rescue'

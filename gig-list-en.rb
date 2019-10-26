@@ -7,6 +7,7 @@ require 'awesome_print'
 require 'facets/hash/symbolize_keys'
 require 'plissken'
 require 'yaml'
+require 'nokogiri'
 
 require_relative 'ruby-progressbar-twoline/ruby-progressbar-twoline.rb'
 
@@ -34,6 +35,10 @@ end
 
 def join_url_params(params)
   params.map { |*a| a.join('=') }.join('&')
+end
+
+def NilifyBlank(str)
+  str&.empty? ? nil : str
 end
 
 class GetBands
@@ -157,7 +162,7 @@ class GetPageEventIds
   end
 end
 
-def cached(name:, refresh:)
+def Cached(name:, refresh:)
   FileUtils.mkdir_p('cache')
   filename = "cache/#{name}.yaml"
   if File.exists?(filename) && !refresh
@@ -169,7 +174,7 @@ def cached(name:, refresh:)
   end
 end
 
-class GetEventDetails
+class GetEventDetailsFromPageJson
   def initialize(event_id:, logger:)
     @event_id = event_id
     @logger = logger
@@ -185,7 +190,102 @@ class GetEventDetails
   attr_reader :event_id, :logger
 
   def get_event_details
-    response = http
+    html = GetEventPage.new(event_id: event_id).call
+    json = html
+      .scan(%r{<script[> ].+?</script>})
+      .find { |s| s.include?('"address":{"') }
+      &.gsub(%r{</?script[^>]*>}, '')
+    return unless json
+    JSON.parse(json, symbolize_names: true)
+      .to_snake_keys
+  end
+end
+
+class GetEventDetailsFromPageHtml
+  def initialize(event_id:, logger:)
+    @event_id = event_id
+    @logger = logger
+  end
+
+  def call
+    get_event_details
+  end
+
+  private
+
+  attr_reader :event_id, :logger
+
+  def get_event_details
+    html = GetEventPage.new(event_id: event_id).call
+    doc = Nokogiri::HTML(html)
+    field_map.each_with_object({}) do |(field_name, path), event|
+      node = doc.css(path[:css][:selector])[path[:css][:index]]
+      value_processor = path[:css][:value]
+      value = value_processor ? value_processor.call(node) : node&.text
+      event[field_name] = NilifyBlank(value)
+    end
+  end
+
+  def field_map
+    @@field_map ||= {
+      title: {
+        css: {
+          selector: '#rootcontainer header h3',
+          index: 0,
+        },
+      },
+      date: {
+        css: {
+          selector: '#event_summary .fbEventInfoText dt',
+          index: 0,
+        },
+      },
+      venue: {
+        css: {
+          selector: '#event_summary .fbEventInfoText dt',
+          index: 1,
+        },
+      },
+      address: {
+        css: {
+          selector: '#event_summary .fbEventInfoText dd',
+          index: 1,
+        },
+      },
+      status: {
+        css: {
+          selector: '#event_button_bar a[role="button"]',
+          index: 0,
+          value: -> node {
+            case node.css('i').size
+            when 1 then 'Unresponded' # no dropdown shown, so no status is selected
+            when 2 then node.text # dropdown shown, so a status is selected
+            else raise
+            end
+          },
+        },
+      },
+    }
+  end
+end
+
+class GetEventPage
+  def initialize(event_id:)
+    @event_id = event_id
+  end
+
+  def call
+    Cached(name: "event-html-for-event-#{event_id}", refresh: ARGV.include?('--refresh-event-html')) do
+      get_event_page
+    end
+  end
+
+  private
+
+  attr_reader :event_id
+
+  def get_event_page
+    http
       .headers(
         'authority' => 'm.facebook.com',
         'upgrade-insecure-requests' => '1',
@@ -198,15 +298,10 @@ class GetEventDetails
         'cookie' => ENV.fetch('FACEBOOK_COOKIES'),
       )
       .get("/events/#{event_id}/")
-    html = response.to_s
-    json = html
-      .scan(%r{<script[> ].+?</script>})
-      .find { |s| s.include?('"address":{"') }
-      &.gsub(%r{</?script[^>]*>}, '')
-    return unless json
-    JSON.parse(json, symbolize_names: true)
-      .to_snake_keys
+      .to_s
   end
+
+  private
 
   def http
     @@http ||= HTTP.persistent('https://m.facebook.com')
@@ -214,7 +309,7 @@ class GetEventDetails
 end
 
 puts 'Collecting band IDs from profile likes API...'
-bands = cached(name: 'bands', refresh: ARGV.include?('--refresh-band-list')) do
+bands = Cached(name: 'bands', refresh: ARGV.include?('--refresh-band-list')) do
   GetBands.new(my_id: 1597675905).call
 end
 
@@ -225,7 +320,7 @@ progressbar, logger = make_progess_bar(total: bands.count)
 output = bands.map do |band|
   band_id = band.fetch(:id)
 
-  event_ids = cached(name: "event-ids-for-band-#{band_id}", refresh: ARGV.include?('--refresh-event-list')) do
+  event_ids = Cached(name: "event-ids-for-band-#{band_id}", refresh: ARGV.include?('--refresh-event-list')) do
     GetPageEventIds.new(page_id: band_id, logger: logger).call
   end
 
@@ -244,7 +339,7 @@ end
 progressbar.stop
 ap output
 
-puts 'Collecting event details by scraping event pages...'
+puts 'Collecting event details by scraping JSON from event pages...'
 
 events_count = output.sum { |band| band.fetch(:events).count }
 progressbar, logger = make_progess_bar(total: events_count)
@@ -253,8 +348,8 @@ output_with_event_details = output.map do |band|
   band.merge(
     events: band[:events].map do |event|
       event_id = event.fetch(:id)
-      event_details = cached(name: "event-details-for-event-#{event_id}", refresh: ARGV.include?('--refresh-event-details')) do
-        GetEventDetails.new(event_id: event_id, logger: logger).call
+      event_details = Cached(name: "event-details-for-event-#{event_id}", refresh: ARGV.include?('--refresh-event-details')) do
+        GetEventDetailsFromPageJson.new(event_id: event_id, logger: logger).call
       end
 
       progressbar.increment
@@ -267,3 +362,23 @@ output_with_event_details = output.map do |band|
 end
 progressbar.stop
 ap output_with_event_details
+
+puts 'Collecting remaining event details by scraping HTML from event pages...'
+
+remaining_event_details_from_html = output_with_event_details
+  .flat_map { |band| band.fetch(:events) }
+  .select { |event| !event[:details] }
+  .tap do |remaining_events|
+    progressbar, logger = make_progess_bar(total: remaining_events.count)
+  end
+  .map do |event|
+    event_id = event[:id]
+    { id: event_id }.merge(
+      GetEventDetailsFromPageHtml.new(event_id: event_id, logger: logger).call.tap do
+        progressbar.increment
+      end
+    )
+      .tap { |x| logger.puts x.ai }
+  end
+progressbar.stop
+ap remaining_event_details_from_html

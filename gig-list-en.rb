@@ -5,7 +5,10 @@
 require 'http'
 require 'awesome_print'
 require 'facets/hash/symbolize_keys'
+require 'plissken'
 require 'yaml'
+
+require_relative 'ruby-progressbar-twoline/ruby-progressbar-twoline.rb'
 
 STDOUT.sync = true
 
@@ -35,8 +38,8 @@ class GetBands
     cursor = ''
     while cursor do
       result = get_paginated_bands(cursor: cursor)
-      bands += result.fetch('data')
-      cursor = result.fetch('paging').then { |paging| paging['next'] && paging.fetch('cursors').fetch('after') }
+      bands += result.fetch(:data)
+      cursor = result.fetch(:paging).then { |paging| paging[:next] && paging.fetch(:cursors).fetch(:after) }
     end
     bands
       .map(&:symbolize_keys)
@@ -52,7 +55,7 @@ class GetBands
     )
     debug 'Fetching: ' + full_url
     response = http.get(full_url)
-    JSON.parse(response.to_s)
+    JSON.parse(response.to_s, symbolize_names: true)
       # .tap(&method(:debug))
   end
 
@@ -67,8 +70,9 @@ class GetBands
 end
 
 class GetPageEventIds
-  def initialize(page_id:)
+  def initialize(page_id:, logger: STDOUT)
     @page_id = page_id
+    @logger = logger
   end
 
   def call
@@ -77,7 +81,7 @@ class GetPageEventIds
 
   private
 
-  attr_reader :page_id
+  attr_reader :page_id, :logger
 
   def get_all_events
     events, cursor = get_paginated_first
@@ -91,7 +95,7 @@ class GetPageEventIds
 
   def get_paginated_first
     full_url = "/#{page_id}/events/"
-    debug 'Fetching: ' + full_url
+    logger.puts ('Fetching: ' + full_url).ai
     html = http
       .get(full_url)
       .to_s
@@ -111,7 +115,7 @@ class GetPageEventIds
       serialized_cursor: cursor,
     }
     full_url = '/pages/events/more/?' + join_url_params(params)
-    debug 'Fetching: ' + full_url
+    logger.puts ('Fetching: ' + full_url).ai
     response = http
       .headers('X-Response-Format' => 'JSONStream')
       .get(full_url)
@@ -149,17 +153,67 @@ def cached(name:, refresh:)
   end
 end
 
+class GetEventDetails
+  def initialize(event_id:)
+    @event_id = event_id
+  end
+
+  def call
+    get_event_details
+  end
+
+  private
+
+  attr_reader :event_id
+
+  def get_event_details
+    response = http
+      .headers(
+        'authority' => 'm.facebook.com',
+        'upgrade-insecure-requests' => '1',
+        'user-agent' => 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/77.0.3865.120 Safari/537.36',
+        'sec-fetch-mode' => 'navigate',
+        'sec-fetch-user' => '?1',
+        'accept' => 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3',
+        'sec-fetch-site' => 'none',
+        'accept-language' => 'en-US,en;q=0.9,en-AU;q=0.8',
+        'cookie' => ENV.fetch('FACEBOOK_COOKIES'),
+      )
+      .get("/events/#{event_id}/")
+    html = response.to_s
+    json = html
+      .scan(%r{<script[> ].+?</script>})
+      .find { |s| s.include?('"address":{"') }
+      .gsub(%r{</?script[^>]*>}, '')
+    JSON.parse(json, symbolize_names: true)
+      .to_snake_keys
+  end
+
+  def http
+    @@http ||= HTTP.persistent('https://m.facebook.com')
+  end
+end
+
 puts 'Bands:'
 bands = cached(name: 'bands', refresh: ARGV.include?('--refresh-bands')) do
   GetBands.new(my_id: 1597675905).call
 end
 
+progressbar = ProgressBar.create(
+  format: "%t %b%i\n%a %E  Processed: %c of %C, %P%",
+  remainder_mark: '-',
+  total: bands.count,
+)
+logger = Class.new(SimpleDelegator) { def puts(*m); log(*m); end }.new(progressbar)
+
 output = bands.map do |band|
   band_id = band.fetch(:id)
 
   event_ids = cached(name: "event-ids-for-band-#{band_id}", refresh: ARGV.include?('--refresh-events')) do
-    GetPageEventIds.new(page_id: band_id).call
+    GetPageEventIds.new(page_id: band_id, logger: logger).call
   end
+
+  progressbar.increment
 
   {
     name: band.fetch(:name),
@@ -171,4 +225,10 @@ output = bands.map do |band|
     end
   }
 end
+progressbar.stop
 ap output
+
+event_details = GetEventDetails.new(event_id: 752174271880245).call
+ap event_details
+require 'pry'; binding.pry
+puts

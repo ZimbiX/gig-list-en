@@ -104,6 +104,7 @@ class GetPageEventIds
 
   attr_reader :page_id, :logger
 
+  # TODO: Get locations here at the same time so we can exclude events from the slow per-page fetching
   def get_all_events
     events, cursor = get_paginated_first
     while cursor do
